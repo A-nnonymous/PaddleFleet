@@ -92,12 +92,16 @@ class ModuleContext:
 
 def patch_module_namespace(source_name: str, target_prefix: str):
     """
-    Moves loaded modules from source_name to target_prefix + source_name.
-    Effectively 'installs' the module into the new namespace.
+    Aliases loaded modules from ``source_name`` into ``target_prefix + source_name``.
+
+    Keep the original module names alive in ``sys.modules`` so later absolute
+    imports like ``import sonicmoe.functional`` reuse the already loaded bundled
+    modules instead of importing a second editable-installed copy and
+    re-registering custom ops.
     """
     for name in list(sys.modules.keys()):
         if name == source_name or name.startswith(source_name + "."):
-            module = sys.modules.pop(name)
+            module = sys.modules[name]
             new_name = target_prefix + name
             sys.modules[new_name] = module
 

@@ -177,9 +177,12 @@ class GroupedMLPExpert(FleetLayer):
 
         # No tensor parallel - full sizes
         fc1_output_size = self.config.moe_intermediate_size
-        if config.gated_linear_unit:
+        if config.gated_linear_unit or self.using_sonic_moe:
             # Project to 4h. If using swiglu double the output width,
             # see https://arxiv.org/pdf/2002.05202.pdf
+            # Sonic MoE always uses SwiGLU activation internally,
+            # so fc1 must be doubled even when gated_linear_unit is
+            # not explicitly set.
             fc1_output_size *= 2
 
         fc2_input_size = self.config.moe_intermediate_size

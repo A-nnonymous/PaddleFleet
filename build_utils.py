@@ -77,6 +77,8 @@ class EcosystemLibrary:
         source_rel_path: str,
         artifacts: list[Artifact],
         extra_env: dict[str, str] | None = None,
+        no_pep517: bool = False,
+        skip_build: bool = False,
     ):
         self.name = name
         self.source_dir = ROOT_DIR / source_rel_path
@@ -84,9 +86,16 @@ class EcosystemLibrary:
         self.install_dir = THIRD_PARTY_INSTALL_TEMP / name
         self.artifacts = artifacts
         self._extra_env = extra_env or {}
+        self._no_pep517 = no_pep517
+        self._skip_build = skip_build
 
     def build(self) -> None:
         """Builds the library."""
+        if self._skip_build:
+            logger.info(
+                f"Skipping build for ecosystem library: {self.name} (skip_build=True)"
+            )
+            return
         logger.info(f"Building ecosystem library: {self.name}")
         self.install_dir.mkdir(parents=True, exist_ok=True)
 
@@ -121,10 +130,26 @@ class EcosystemLibrary:
             "--upgrade",
             "-v",
         ]
+        # Some libs (e.g. DeepEP) have only setup.py and no build-backend in
+        # pyproject.toml; pip requires --no-use-pep517 in that case to avoid
+        # a "BackendUnavailable: Cannot find module 'setuptools.build_meta'"
+        # error when running inside a subprocess spawned by build_backend.py.
+        if self._no_pep517:
+            cmd.append("--no-use-pep517")
 
         try:
             _env = os.environ.copy()
             _env.update(self._extra_env)
+            # When build_backend.py spawns a subprocess pip for pyproject.toml
+            # libs (e.g. quack, sonic-moe), the pip hook process starts with a
+            # minimal sys.path that only contains the project directory and
+            # misses site-packages. Inject PYTHONPATH so setuptools.build_meta
+            # is resolvable in --no-build-isolation mode.
+            import sysconfig
+
+            sp = sysconfig.get_paths()["purelib"]
+            existing = _env.get("PYTHONPATH", "")
+            _env["PYTHONPATH"] = f"{sp}:{existing}" if existing else sp
             subprocess.check_call(cmd, cwd=self.source_dir, env=_env)
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to build {self.name}: {e}")
@@ -273,6 +298,7 @@ def get_libs():
                 Artifact("deep_gemm", "deep_gemm"),
                 Artifact("deep_gemm_cpp", "deep_gemm_cpp"),
             ],
+            no_pep517=True,
         ),
         EcosystemLibrary(
             name="DeepEP",
@@ -284,6 +310,7 @@ def get_libs():
             extra_env={"PADDLE_CUDA_ARCH_LIST": "9.0"}
             if (cuda_major == 12 and cuda_minor < 8)
             else {"PADDLE_CUDA_ARCH_LIST": "9.0;10.0;10.3"},
+            no_pep517=True,
         ),
         EcosystemLibrary(
             name="flash-attention",
@@ -292,6 +319,7 @@ def get_libs():
                 Artifact("flash_mask", "flash_mask"),
             ],
             extra_env={"FLASHMASK_BUILD": "fa4"},
+            no_pep517=True,
         ),
     ]
     if sys.version_info >= (3, 12):
@@ -302,6 +330,11 @@ def get_libs():
                 artifacts=[
                     Artifact("quack", "quack"),
                 ],
+                # quack and sonic-moe are installed editably from sonicmoe_for_ernie.
+                # Their _third_party_install_temp entries are pre-populated as symlinks
+                # by setup_paddlefleet_dev.sh before this build runs, so we skip the
+                # pip build step and go straight to the symlink install phase.
+                skip_build=True,
             )
         )
         LIBRARIES.append(
@@ -311,6 +344,7 @@ def get_libs():
                 artifacts=[
                     Artifact("sonicmoe", "sonicmoe"),
                 ],
+                skip_build=True,
             )
         )
     return LIBRARIES
