@@ -320,6 +320,14 @@ class ExpertsGroupGemmContiguousNode:
         moe_grouped_gemm=False,
         dw_p2p_overlap=False,
     ):
+        # Keep a reference to the owning MoELayer so that we can forward
+        # intermediate-tensor snapshots (`sonic_z`, `sonic_y1`,
+        # `sonic_down_out` and their gradients) to its debug-dump buffer
+        # when `MOE_DEBUG_DUMP=1`.  Baseline (`using_sonic_moe=False`)
+        # goes through this fused node in the distributed EP path and
+        # would otherwise never record these intermediates — without it
+        # the diff against `run_sonic_moe` dumps is blind.
+        self._custom_map = custom_map
         """
             Initializes the experts group gemm contiguous node.
 
@@ -410,6 +418,35 @@ class ExpertsGroupGemmContiguousNode:
         self.input_fp8 = None
         self.input_scale = None
         self.o1 = None
+
+    def _dbg_dump_enabled(self):
+        """Return True iff the owning MoELayer has debug dumps turned on."""
+        cm = self._custom_map
+        return cm is not None and getattr(cm, "_debug_dump_enabled", False)
+
+    def _dbg_store_fwd(self, name, tensor):
+        """Store a forward snapshot in the MoELayer's fwd dump table.
+
+        Called from within @paddle.no_grad forward paths, so we cannot
+        rely on autograd hooks for the matching backward — the matching
+        gradient is instead pushed via `_dbg_store_bwd` from inside
+        `backward_impl_*`.
+        """
+        if not self._dbg_dump_enabled() or tensor is None:
+            return
+        try:
+            self._custom_map._debug_dump["fwd"][name] = tensor.detach().clone()
+        except Exception:
+            pass
+
+    def _dbg_store_bwd(self, name, tensor):
+        """Store a gradient snapshot in the MoELayer's bwd dump table."""
+        if not self._dbg_dump_enabled() or tensor is None:
+            return
+        try:
+            self._custom_map._debug_dump["bwd"][name] = tensor.detach().clone()
+        except Exception:
+            pass
 
     def gen_m_indices(self, tokens_per_expert):
         """
@@ -1158,6 +1195,26 @@ class ExpertsGroupGemmContiguousNode:
         o1 = self.fwd_gate_up(
             hs_out, expert_w1, num_expert, tokens_per_expert, scale=scale
         )
+        # ── debug dump: sonic_z (pre-SwiGLU gate_up output) ───────────
+        # Baseline's `grouped_gemm_experts.weight1` is laid out in
+        # concat `[gate_all | up_all]` along the last axis, so the
+        # GEMM output `o1` is already in the same layout as the
+        # de-interleaved `sonic_z` produced by `run_sonic_moe` — no
+        # extra shuffling needed here.  Matching forward/backward
+        # grads are pushed in `backward_impl_*`.
+        self._dbg_store_fwd("sonic_z", o1)
+        # ── debug dump: sonic_y1 (post-SwiGLU activation) ─────────────
+        # The fused fp8 down path consumes `o1` via
+        # `fuse_weighted_swiglu_fp8_quant` and never materialises the
+        # unscaled bf16 `y1 = swiglu(o1)` that the sonic kernel dumps.
+        # Recompute a throwaway `swiglu(o1)` here purely for diffing —
+        # only runs when MOE_DEBUG_DUMP is on.
+        if self._dbg_dump_enabled():
+            try:
+                self._dbg_store_fwd("sonic_y1", swiglu(o1))
+            except Exception:
+                pass
+
         if not self.recompute_moe_gate_up:
             self.o1 = o1
             clear_o1 = False
@@ -1181,6 +1238,8 @@ class ExpertsGroupGemmContiguousNode:
             o3=fwd_down_output,
             clear_o1=clear_o1,
         )
+        # ── debug dump: sonic_down_out (post-down-proj) ───────────────
+        self._dbg_store_fwd("sonic_down_out", o3)
         return o3
 
     @paddle.no_grad()
@@ -1412,6 +1471,8 @@ class ExpertsGroupGemmContiguousNode:
         """
         backward_impl_bf16
         """
+        # ── debug dump: gradient w.r.t. sonic_down_out ────────────────
+        self._dbg_store_bwd("sonic_down_out", out_grad)
         if a2a_async_fn is not None:
             raise NotImplementedError(
                 "bf16 fuse node do not support a2a_async_fn currently"
@@ -1457,6 +1518,11 @@ class ExpertsGroupGemmContiguousNode:
         do1, o2_s, probs_grad = self.bwd_down_input_bf16(
             expert_w2, out_grad, o1, unzipped_probs
         )
+        # ── debug dump: gradient w.r.t. sonic_z (pre-SwiGLU) ──────────
+        # `do1` is the grad flowing back through SwiGLU — the same
+        # semantic quantity that the sonic path stores as `sonic_z`'s
+        # gradient via the `_z_hook` closure in `run_sonic_moe`.
+        self._dbg_store_bwd("sonic_z", do1)
         del o1
         self.o1 = None
 
@@ -1515,6 +1581,8 @@ class ExpertsGroupGemmContiguousNode:
         """
         backward_impl
         """
+        # ── debug dump: gradient w.r.t. sonic_down_out ────────────────
+        self._dbg_store_bwd("sonic_down_out", out_grad)
         if hasattr(self, "grouped_gemm_experts"):
             expert_w1 = self.grouped_gemm_experts.weight1
             expert_w2 = self.grouped_gemm_experts.weight2
@@ -1540,6 +1608,10 @@ class ExpertsGroupGemmContiguousNode:
         do1, o2_s, probs_grad = self.bwd_down_input_fp8(
             expert_w2, out_grad, o1, unzipped_probs, inplace_swiglu_prob=True
         )
+        # ── debug dump: gradient w.r.t. sonic_z (pre-SwiGLU) ──────────
+        # Snapshot before the fp8 backward consumes/aliases `do1` (in
+        # the inplace path `do1` shares storage with `o1`).
+        self._dbg_store_bwd("sonic_z", do1)
         # del o1 时机：
         #   inplace（USE_INPLACE_SWIGLU_BWD=True）：do1 与 o1 共用 buffer，refcount
         #     不归零，立即 del 安全。

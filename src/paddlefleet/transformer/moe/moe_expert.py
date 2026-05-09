@@ -144,6 +144,11 @@ class GroupedMLPExpert(FleetLayer):
         self.num_local_experts = num_local_experts
         self.moe_deep_gemm = moe_deep_gemm
         self.using_sonic_moe = self.config.using_sonic_moe
+        if self.using_sonic_moe:
+            assert config.gated_linear_unit is True, (
+                "Sonic MoE must use SwiGLU, i.e. set gated_linear_unit=True."
+            )
+
         assert not config.use_bias, (
             "Bias not supported in Grouped GEMM yet, please set 'use_bias' to False."
         )
@@ -177,7 +182,7 @@ class GroupedMLPExpert(FleetLayer):
 
         # No tensor parallel - full sizes
         fc1_output_size = self.config.moe_intermediate_size
-        if config.gated_linear_unit or self.using_sonic_moe:
+        if config.gated_linear_unit:
             # Project to 4h. If using swiglu double the output width,
             # see https://arxiv.org/pdf/2002.05202.pdf
             # Sonic MoE always uses SwiGLU activation internally,
@@ -262,7 +267,28 @@ class GroupedMLPExpert(FleetLayer):
                     "Recompute in GroupedMLPExpert is not implemented"
                 )
             else:
+                # Debug: map baseline fc1 intermediates to sonic key names.
+                #   fc1_output            = x @ w1   (pre-activation, layout
+                #                           [TK, 2I] as concat [gate|up])
+                #                         ↔ sonic `z` (pre-SwiGLU, layout
+                #                           [TK, 2I] interleaved [g,u,g,u,...])
+                #   intermediate_parallel = SwiGLU(fc1_output) [TK, I]
+                #                         ↔ sonic `y1` (post-SwiGLU) [TK, I]
+                # `sonic_down_out` is NOT dumped here — sonic's
+                # `_DownProjection` returns a post-scatter+combine tensor
+                # of shape [T, H], which corresponds to baseline's
+                # `final_hidden_states` (after `unpermute`), not
+                # `fc2_output` ([TK, H], pre-unpermute).  That dump is
+                # done in MoELayer._forward_single_card_grouped_gemm_moe.
+                # Layout normalization is done on the sonic side (z is
+                # de-interleaved to concat form at dump time) so here we
+                # store the baseline tensors as-is.
+                dbg = getattr(self, "_moe_dbg", None)
+                if dbg is not None:
+                    dbg("sonic_z", fc1_output)
                 intermediate_parallel = self.activation_func(fc1_output)
+                if dbg is not None:
+                    dbg("sonic_y1", intermediate_parallel)
                 if self.moe_deep_gemm:
                     fc2_output = DeepGEMMBMMFunction.apply(
                         intermediate_parallel,

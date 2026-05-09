@@ -58,6 +58,15 @@ _ERNIECORE_ALIGNMENT = (
 _LOG_LAYER_MD5 = os.environ.get("LOG_LAYER_MD5", "0") == "1"
 
 
+# Intermediate-result dump for precision diff debugging
+# When MOE_DEBUG_DUMP=1, MoELayer stores snapshots of forward tensors
+# and registers backward hooks so the test (or any caller) can compare
+# corresponding intermediates across variants (baseline / BF16 / FP8 ...).
+# Read at instance-construction time so tests can toggle via env var.
+def _moe_debug_dump_enabled() -> bool:
+    return os.environ.get("MOE_DEBUG_DUMP", "0") == "1"
+
+
 def _log_moe_md5(tensor, name, layer_idx=None):
     """Log MD5 of a tensor for MoE precision alignment debugging."""
     if _LOG_LAYER_MD5 and _ERNIECORE_ALIGNMENT:
@@ -84,18 +93,17 @@ if paddlefleet.ops.is_sonic_moe_available():
     from paddlefleet.ops.sonicmoe.ernie_compat.deepep_metadata import (
         deepep_topk_to_sonic_metadata,
     )
+    from paddlefleet.ops.sonicmoe.ernie_compat.mlp_node_v2 import (
+        _differentiable_router_scores,
+    )
     from paddlefleet.ops.sonicmoe.functional import (
         _DownProjection,
         _refresh_fp8_config,
         _UpProjection,
-        general_routing_router_metadata,
     )
     from paddlefleet.ops.sonicmoe.functional.utils import enable_fp8
 
 from .moe_utils import (
-    count_cumsum,
-    filter_scores,
-    fused_expert_parallel_TC_topk_router_metadata,
     global_moe_balance_training_logs_enabled,
     log_moe_balance,
     permute,
@@ -148,8 +156,14 @@ class MoELayer(nn.Layer):
         pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__()
+        # Debug dump buffers: populated during forward and backward when
+        # MOE_DEBUG_DUMP=1.  Always-allocated (cheap when disabled because
+        # no tensors ever get inserted); callers should snapshot via
+        # `self._debug_dump` and then call `_dbg_reset()` between steps.
+        self._debug_dump_enabled = _moe_debug_dump_enabled()
+        self._debug_dump = {"fwd": {}, "bwd": {}}
         self.config = config
-        self.sublayers = sublayers
+        self.moe_sublayers = sublayers
         routed_expert_config = deepcopy(config)
         shared_expert_config = deepcopy(config)
         self.pg_collection = pg_collection
@@ -173,6 +187,12 @@ class MoELayer(nn.Layer):
         self.fp8_wgrad = config.fp8_wgrad
         self.dw_p2p_overlap = getattr(config, "dw_p2p_overlap", False)
         self.using_sonic_moe = self.config.using_sonic_moe
+        self.fp8_dispatch = bool(config.fp8) and not self.using_sonic_moe
+        self.fp8_wgrad = config.fp8_wgrad
+        self.moe_expert_fusion = config.moe_expert_fusion
+        self.moe_subbatch_token_num_after_dispatch = (
+            config.moe_subbatch_token_num_after_dispatch
+        )
         if self.using_sonic_moe:
             assert paddlefleet.ops.is_sonic_moe_available(), (
                 paddlefleet.ops.blocked_import_messages[
@@ -268,17 +288,26 @@ class MoELayer(nn.Layer):
         expert_args["config"] = routed_expert_config
         expert_args["moe_intermediate_size"] = self.moe_intermediate_size
         expert_args["is_expert"] = True
-        expert_args["mlp_spec"] = self.sublayers.mlp_spec
+        expert_args["mlp_spec"] = self.moe_sublayers.mlp_spec
 
+        self.grouped_gemm_experts = None
+        self.experts = None
         if self.moe_grouped_gemm:
             if self.fp8:
-                assert self.using_sonic_moe or self.moe_deep_gemm, "For fp8 grouped_gemm, either set using_sonic_moe=True or moe_deep_gemm=True."
+                assert self.using_sonic_moe or self.moe_deep_gemm, (
+                    "For fp8 grouped_gemm, either set using_sonic_moe=True or moe_deep_gemm=True."
+                )
             self.grouped_gemm_experts = GroupedMLPExpert(
                 self.num_local_experts,
                 routed_expert_config,
                 self.moe_deep_gemm,
                 pg_collection,
             )
+            # Forward a dump callback into the baseline expert so that its
+            # internal fc1_output / intermediate_parallel / fc2_output can
+            # be snapshotted under the same key names used by sonic-moe
+            # (sonic_y1 / sonic_z / sonic_down_out) for per-step diff.
+            self.grouped_gemm_experts._moe_dbg = self._dbg_dump
         else:
             self.experts = nn.LayerList([])
             for i in range(self.num_experts):
@@ -327,19 +356,31 @@ class MoELayer(nn.Layer):
                     f"Unsupported moe_token_dispatcher_type {self.moe_token_dispatcher_type}"
                 )
 
-        self.recompute_moe_gate_up = (
+        self.recompute_moe_gate_up = getattr(
+            self.config, "recompute_moe_gate_up", False
+        ) or (
             self.config.recompute_granularity == "selective"
+            and self.config.recompute_modules is not None
             and "moe_gate_up" in self.config.recompute_modules
         )
-        self.recompute_moe_premute = (
+        self.recompute_moe_premute = getattr(
+            self.config, "recompute_moe_premute", False
+        ) or (
             self.config.recompute_granularity == "selective"
+            and self.config.recompute_modules is not None
             and "moe_premute" in self.config.recompute_modules
+        )
+        self.use_auto_subbatch = getattr(
+            self.config, "use_auto_subbatch", False
+        )
+        self.moe_subbatch_diag = getattr(
+            self.config, "moe_subbatch_diag", False
         )
 
         if self.expert_model_parallel_size > 1:
             self.is_mp_moe = False
             self.is_ep_moe = True
-            if self.moe_grouped_gemm and (not self.fp8 or self.moe_deep_gemm):
+            if self.grouped_gemm_experts is not None:
                 for p in self.grouped_gemm_experts.parameters():
                     p.is_moe_param = True
                     p.color = {
@@ -351,6 +392,9 @@ class MoELayer(nn.Layer):
                     if self.is_mp_moe or self.is_ep_moe:
                         p.is_distributed = True
             else:
+                assert self.experts is not None, (
+                    "experts should be initialized."
+                )
                 for p in self.experts.parameters():
                     p.is_moe_param = True
                     p.color = {
@@ -361,6 +405,43 @@ class MoELayer(nn.Layer):
                     p.expert = not self.is_mp_moe
                     if self.is_mp_moe or self.is_ep_moe:
                         p.is_distributed = True
+
+    # ──────────────────────────── debug dump ────────────────────────────
+    def _dbg_reset(self):
+        """Clear debug dump buffers (keeps dict identities so hook closures
+        registered in previous forwards are harmless after GC)."""
+        if self._debug_dump_enabled:
+            self._debug_dump["fwd"].clear()
+            self._debug_dump["bwd"].clear()
+
+    def _dbg_dump(self, name, tensor, grad_hook=True):
+        """Snapshot `tensor` as forward intermediate `name`; optionally
+        register a backward hook that saves the grad as `bwd[name]`.
+
+        Safe to call unconditionally — becomes a no-op when disabled or
+        when `tensor` is None.
+        """
+        if not self._debug_dump_enabled or tensor is None:
+            return
+        try:
+            self._debug_dump["fwd"][name] = tensor.detach().clone()
+        except Exception:
+            # Some tensors may be non-copyable (e.g. fp8 raw buffers);
+            # skip silently rather than break the forward pass.
+            pass
+        if grad_hook and not getattr(tensor, "stop_gradient", True):
+            store = self._debug_dump["bwd"]
+
+            def _hook(grad, n=name, s=store):
+                try:
+                    s[n] = grad.detach().clone()
+                except Exception:
+                    pass
+
+            try:
+                tensor.register_hook(_hook)
+            except Exception:
+                pass
 
     def _init_expert_parallel(self):
         def _parse_moe_expert_parallel(
@@ -521,70 +602,77 @@ class MoELayer(nn.Layer):
 
         with profile("fusion_mlp"):
             if self.using_sonic_moe:
-                T = dispatched_hidden_states.shape[0]
-                K = self.num_experts_per_tok
-                stream_id = paddle.device.cuda.current_stream().cuda_stream
-                topk_scores = filter_scores(
-                    dispatched_probs,
-                    dispatched_indices,
-                )
-                expert_frequency, expert_frequency_offset = count_cumsum(
-                    dispatched_indices,
-                    self.num_experts_per_device,
-                    do_cumsum=True,
-                )
-                activation_type = ActivationType("swiglu")
-
-                (
-                    expert_frequency_offset,
-                    x_gather_idx,
-                    s_scatter_idx,
-                    s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                ) = fused_expert_parallel_TC_topk_router_metadata(
-                    dispatched_indices,
-                    expert_frequency_offset,
-                    K,
-                )
-
-                TK = s_scatter_idx.shape[0]
-                is_varlen_K = True
-                w1 = self.grouped_gemm_experts.weight1
-                y1, z = _UpProjection.apply(
+                # T = dispatched_hidden_states.shape[0]
+                # K = self.num_experts_per_tok
+                # stream_id = paddle.device.cuda.current_stream().cuda_stream
+                # topk_scores = filter_scores(
+                #     dispatched_probs,
+                #     dispatched_indices,
+                # )
+                use_fp8 = self.fp8 is not None
+                hidden_states = self.run_sonic_moe(
                     dispatched_hidden_states,
-                    w1.permute(1, 2, 0),
-                    None,
-                    expert_frequency_offset,
-                    TK,
-                    K,
-                    stream_id,
-                    x_gather_idx,
-                    s_scatter_idx,
-                    s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    is_varlen_K,
-                    activation_type,
-                    is_inference_mode_enabled=False,
+                    dispatched_indices,
+                    dispatched_probs,
+                    use_fp8,
                 )
+                # expert_frequency, expert_frequency_offset = count_cumsum(
+                #     dispatched_indices,
+                #     self.num_experts_per_device,
+                #     do_cumsum=True,
+                # )
+                # activation_type = ActivationType("swiglu")
 
-                w2 = self.grouped_gemm_experts.weight2
-                hidden_states = _DownProjection.apply(
-                    y1,
-                    z,
-                    w2.permute(1, 2, 0),
-                    None,
-                    topk_scores,
-                    expert_frequency_offset,
-                    T,
-                    K,
-                    stream_id,
-                    x_gather_idx,
-                    s_scatter_idx,
-                    s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    is_varlen_K,
-                    activation_type,
-                )
+                # (
+                #     expert_frequency_offset,
+                #     x_gather_idx,
+                #     s_scatter_idx,
+                #     s_reverse_scatter_idx,
+                #     num_activated_expert_per_token_offset,
+                # ) = fused_expert_parallel_TC_topk_router_metadata(
+                #     dispatched_indices,
+                #     expert_frequency_offset,
+                #     K,
+                # )
+
+                # TK = s_scatter_idx.shape[0]
+                # is_varlen_K = True
+                # w1 = self.grouped_gemm_experts.weight1
+                # y1, z = _UpProjection.apply(
+                #     dispatched_hidden_states,
+                #     w1.permute(1, 2, 0),
+                #     None,
+                #     expert_frequency_offset,
+                #     TK,
+                #     K,
+                #     stream_id,
+                #     x_gather_idx,
+                #     s_scatter_idx,
+                #     s_reverse_scatter_idx,
+                #     num_activated_expert_per_token_offset,
+                #     is_varlen_K,
+                #     activation_type,
+                #     is_inference_mode_enabled=False,
+                # )
+
+                # w2 = self.grouped_gemm_experts.weight2
+                # hidden_states = _DownProjection.apply(
+                #     y1,
+                #     z,
+                #     w2.permute(1, 2, 0),
+                #     None,
+                #     topk_scores,
+                #     expert_frequency_offset,
+                #     T,
+                #     K,
+                #     stream_id,
+                #     x_gather_idx,
+                #     s_scatter_idx,
+                #     s_reverse_scatter_idx,
+                #     num_activated_expert_per_token_offset,
+                #     is_varlen_K,
+                #     activation_type,
+                # )
             else:
                 hidden_states = FusionMoePyLayer.apply(
                     dispatched_hidden_states,
@@ -749,6 +837,11 @@ class MoELayer(nn.Layer):
         layer_idx = getattr(self, "layer_number", None)
         _log_moe_md5(hidden_states, "moe_input", layer_idx)
 
+        # Reset debug-dump buffers at the start of each forward so every
+        # step's snapshot is independent.
+        self._dbg_reset()
+        self._dbg_dump("moe_input", hidden_states)
+
         (
             capacity,
             topk_weights,
@@ -765,6 +858,11 @@ class MoELayer(nn.Layer):
 
         _log_moe_md5(gates_masked, "gates_masked", layer_idx)
         _log_moe_md5(mask, "routing_mask", layer_idx)
+
+        self._dbg_dump("gates_masked", gates_masked)
+        self._dbg_dump("topk_weights", topk_weights)
+        self._dbg_dump("mask", mask, grad_hook=False)
+        self._dbg_dump("topk_indices", topk_indices, grad_hook=False)
 
         if (
             self.shared_experts is not None
@@ -805,6 +903,7 @@ class MoELayer(nn.Layer):
                 )
 
         _log_moe_md5(output, "moe_routed_output", layer_idx)
+        self._dbg_dump("routed_output", output)
 
         if self.training and self.router_aux_loss_coef:
             aux_loss = aux_loss * float(self.router_aux_loss_coef)
@@ -819,6 +918,7 @@ class MoELayer(nn.Layer):
             output = output + shared_output
 
         _log_moe_md5(output, "moe_final_output", layer_idx)
+        self._dbg_dump("moe_output", output)
 
         if self.expert_model_parallel_size <= 1 and self.sequence_parallel:
             output = ScatterOp.apply(output)
@@ -888,78 +988,56 @@ class MoELayer(nn.Layer):
         E = self.num_experts_per_device
         stream_id = paddle.device.cuda.current_stream().cuda_stream
 
-        if not fp8:
-            # --- Routing metadata: only integer ops, no Paddle autograd nodes ---
-            tok_ids = (
-                paddle.arange(T, dtype="int32")
-                .unsqueeze(1)
-                .expand([T, K])
-                .reshape([-1])
-            )
-            exp_ids = topk_indices.reshape([-1]).cast("int32")
-            scores_flat = topk_scores.reshape([-1])
-            (
-                _expert_frequency,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            ) = general_routing_router_metadata(
-                scores_flat,
-                tok_ids,
-                exp_ids,
-                T,
-                E,
-            )
-        else:
-            tokens_per_expert = paddle.bincount(
-                topk_indices.reshape([-1]).cast("int32"), minlength=E
-            ).cast(paddle.int32)
+        valid = topk_indices >= 0
+        valid_experts = topk_indices[valid].cast(paddle.int32)
+        tokens_per_expert = paddle.bincount(valid_experts, minlength=E).cast(
+            paddle.int32
+        )
 
-            (
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-                _router_scores,
-                TK_padded,
-                total_pad_rows,
-                _N_recv,
-            ) = deepep_topk_to_sonic_metadata(
-                topk_indices.cast(paddle.int32),
-                topk_scores,
-                tokens_per_expert,
-                E,
-            )
+        (
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+            _router_scores,
+            TK_padded,
+            total_pad_rows,
+            _N_recv,
+            _score_src_idx,
+        ) = deepep_topk_to_sonic_metadata(
+            topk_indices.cast(paddle.int32),
+            topk_scores,
+            tokens_per_expert,
+            E,
+            block=128 if fp8 else 1,
+        )
 
         s_scatter_idx.stop_gradient = True
         w1 = self.grouped_gemm_experts.weight1
         w2 = self.grouped_gemm_experts.weight2
         activation_type = ActivationType("swiglu")
 
-        if fp8:
-            _refresh_fp8_config()
+        total_expert_freq = TK_padded
+        scores_for_down = _differentiable_router_scores(
+            topk_scores,
+            topk_indices.cast(paddle.int32),
+            num_activated_expert_per_token_offset,
+            TK_padded - total_pad_rows,
+            TK_padded,
+            E,
+            score_src_idx=_score_src_idx,
+        )
 
-        total_expert_freq = TK_padded if fp8 else T * K
-        if fp8:
-            scores_for_down = topk_scores.reshape([-1])
-            if total_pad_rows > 0:
-                scores_for_down = paddle.concat(
-                    [
-                        scores_for_down,
-                        paddle.zeros(
-                            [total_pad_rows],
-                            dtype=scores_for_down.dtype,
-                        ),
-                    ],
-                    axis=0,
-                )
-        else:
-            scores_for_down = topk_scores
+        print("==== fp8:", fp8)
+        # FP8 path: use sonicmoe's optimized FP8 GEMM kernels.
+        # Scores are applied AFTER the down-projection inside
+        # _router_forward — mathematically equivalent to the
+        # baseline's score-before-downproj for per-row scalars.
+        # if fp8:
 
         with enable_fp8(fp8):
+            _refresh_fp8_config()
             y1, z = _UpProjection.apply(
                 hidden_states,
                 w1.permute([1, 2, 0]),
@@ -972,11 +1050,57 @@ class MoELayer(nn.Layer):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
-                False,
+                True,  # is_varlen_k
                 activation_type,
                 is_inference_mode_enabled=False,
                 use_low_precision_postact_buffer=False,
             )
+            self._dbg_dump("sonic_y1", y1)
+            # `z` is the pre-SwiGLU fc1 output.  Sonic stores it in
+            # interleaved layout [g0, u0, g1, u1, ...] along the last
+            # axis, whereas baseline GroupedMLPExpert produces it in
+            # concat layout [gate_all | up_all].  De-interleave here so
+            # the dumped tensor matches the baseline layout and can be
+            # diffed element-wise.
+            #
+            # The forward snapshot is taken from a detached clone of z
+            # (autograd-free; the reshape/concat is cheap).  The
+            # backward hook must be registered on the *original* z
+            # (which is actually in the graph via _DownProjection),
+            # and the interleaved grad is reshaped to concat form
+            # inside the callback before storing — a hook registered
+            # on the detached/reshaped tensor would never fire.
+            if self._debug_dump_enabled and z is not None:
+                try:
+                    dbg_z = z.detach().clone()
+                    two_i = dbg_z.shape[-1]
+                    z_pair = dbg_z.reshape([*dbg_z.shape[:-1], two_i // 2, 2])
+                    z_concat = paddle.concat(
+                        [z_pair[..., 0], z_pair[..., 1]], axis=-1
+                    )
+                    self._dbg_dump("sonic_z", z_concat, grad_hook=False)
+                    if not getattr(z, "stop_gradient", True):
+                        store = self._debug_dump["bwd"]
+
+                        def _z_hook(grad, s=store):
+                            try:
+                                ti = grad.shape[-1]
+                                gpair = grad.reshape(
+                                    [*grad.shape[:-1], ti // 2, 2]
+                                )
+                                g_concat = paddle.concat(
+                                    [gpair[..., 0], gpair[..., 1]], axis=-1
+                                )
+                                s["sonic_z"] = g_concat.detach().clone()
+                            except Exception:
+                                s["sonic_z"] = grad.detach().clone()
+
+                        try:
+                            z.register_hook(_z_hook)
+                        except Exception:
+                            pass
+                except Exception:
+                    self._dbg_dump("sonic_z", z)
 
             hidden_states = _DownProjection.apply(
                 y1,
@@ -993,10 +1117,11 @@ class MoELayer(nn.Layer):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
-                False,
+                True,  # is_varlen_k
                 activation_type,
                 None,
             )
+            self._dbg_dump("sonic_down_out", hidden_states)
 
         return hidden_states
 
@@ -1039,6 +1164,9 @@ class MoELayer(nn.Layer):
             permuted_local_hidden_states, sorted_indices = permute(
                 hidden_states, routing_map, tokens_per_expert
             )
+            self._dbg_dump(
+                "baseline_permuted_input", permuted_local_hidden_states
+            )
             grouped_expert_out = self.grouped_gemm_experts(
                 permuted_local_hidden_states, tokens_per_expert
             )[0]
@@ -1049,6 +1177,12 @@ class MoELayer(nn.Layer):
                 probs=probs,
                 routing_map=routing_map,
             )
+            # sonic's `_DownProjection` returns a post-scatter+combine
+            # tensor of shape [T, H]; baseline's equivalent is the
+            # output of `unpermute` (which also weights and combines
+            # the k expert contributions).  Dump under sonic key name
+            # so diff tool aligns them directly.
+            self._dbg_dump("sonic_down_out", final_hidden_states)
             return final_hidden_states.cast(hidden_states.dtype)
 
     def fp8_quant_weight(self, batch_mode=False, quant_transpose=True):
