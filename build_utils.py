@@ -131,11 +131,14 @@ class EcosystemLibrary:
             "-v",
         ]
         # Some libs (e.g. DeepEP) have only setup.py and no build-backend in
-        # pyproject.toml; pip requires --no-use-pep517 in that case to avoid
-        # a "BackendUnavailable: Cannot find module 'setuptools.build_meta'"
-        # error when running inside a subprocess spawned by build_backend.py.
+        # pyproject.toml; older pip required --no-use-pep517 in that case.
+        # pip >= 23.1 removed --no-use-pep517 (legacy builds are auto-detected
+        # when no [build-system] is present), so only add it on older versions.
         if self._no_pep517:
-            cmd.append("--no-use-pep517")
+            from pip import __version__ as _pip_ver
+
+            if Version(_pip_ver) < Version("23.1"):
+                cmd.append("--no-use-pep517")
 
         try:
             _env = os.environ.copy()
@@ -158,8 +161,10 @@ class EcosystemLibrary:
     def install(self, use_symlinks: bool = False) -> None:
         """Installs artifacts to the ops directory via symlink or copy."""
         for artifact in self.artifacts:
-            # Artifact source path is relative to the installation directory
-            src = self.install_dir / artifact.source_rel_path
+            # For skip_build libs, artifacts live directly in the source tree;
+            # otherwise they are in the pip --target install directory.
+            base_dir = self.source_dir if self._skip_build else self.install_dir
+            src = base_dir / artifact.source_rel_path
             dst = OPS_DIR / artifact.target_name
 
             if use_symlinks:
